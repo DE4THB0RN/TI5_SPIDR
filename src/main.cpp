@@ -1,15 +1,22 @@
 #include <Arduino.h>
 #include <user_interface.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClientSecureBearSSL.h>
 
 //=================================================================================================
 // Definição de constantes
 //=================================================================================================
 #define MAX_CANAIS = 13;
+#define PURGETIME 600000
 
 #define TYPE_MANAGEMENT 0x00
 #define TYPE_CONTROL 0x01
 #define TYPE_DATA 0x02
 #define SUBTYPE_PROBE_REQUEST 0x04
+#define MAX_AP 100
+#define MAX_CLIENT 100
+#define ETH_MAC_LEN 6
 
 #define DISABLE 0
 #define ENABLE 1
@@ -17,6 +24,11 @@
 #define CHANNEL_HOP_INTERVAL_MS 1000
 static os_timer_t channelHop_timer;
 
+// Informação do WiFi
+const char *SSID = "2G NET";         // Rede wifi
+const char *PASSWORD = "2512101406"; // Senha da rede wifi
+
+String BASE_URL = "https://backend-ti5-production.up.railway.app/";
 //=================================================================================================
 // Definições de struct
 //=================================================================================================
@@ -80,6 +92,7 @@ typedef struct cliente
   int err;
   signed rssi;
   uint16_t seq_n;
+  long tempo_descoberta;
 } cliente;
 
 typedef struct beacon
@@ -91,12 +104,25 @@ typedef struct beacon
   int err;
   signed rssi;
   uint8_t capa[2];
+  long tempo_descoberta;
 } beacon;
 //=================================================================================================
 //=================================================================================================
+// Definição de arrays para guardar aparelhos observados
+//=================================================================================================
+beacon aps_vistos[MAX_AP];
+cliente clientes_vistos[MAX_CLIENT];
+int quant_aps = 0;
+int quant_clientes = 0;
+int nada_novo = 0;
+int quant_clientes_velho = 0, quant_aps_velho = 0;
+//=================================================================================================
+
+//=================================================================================================
 // Definição de métodos
 //=================================================================================================
-static void ICACHE_FLASH_ATTR promiscuous_handler(uint8_t *buffer, uint16_t length);
+static void ICACHE_FLASH_ATTR
+promiscuous_handler(uint8_t *buffer, uint16_t length);
 String lerMAC(uint8_t MAC[6]);
 void pularCanal();
 cliente ler_probe(uint8_t *quadro, uint16_t len, signed rssi);
@@ -104,6 +130,9 @@ cliente ler_dados(uint8_t *quadro, uint16_t len, signed rssi, unsigned canal);
 beacon ler_beacon(uint8_t *quadro, uint16_t len, signed rssi);
 void printarCliente(cliente cli);
 void printarBeacon(beacon be);
+void setWiFi();
+void enviar_cliente(cliente ci);
+void enviar_beacon(beacon be);
 //=================================================================================================
 //=================================================================================================
 // Métodos para as structs
@@ -277,7 +306,102 @@ String lerMAC(uint8_t MAC[6])
 }
 
 //=================================================================================================
+//=================================================================================================
+// Métodos para rehistro de MACs
+//=================================================================================================
+int registrar_beacon(beacon be)
+{
+  int conhece = 0;
+  for (int i = 0; i < quant_aps; i++)
+  {
+    if (!memcmp(aps_vistos[i].bssid, be.bssid, ETH_MAC_LEN))
+    {
+      aps_vistos[i].tempo_descoberta = millis();
+      aps_vistos[i].rssi = be.rssi;
+      conhece = 1;
+      i = quant_aps;
+    }
+  }
 
+  if (!conhece && be.err == 0)
+  {
+    be.tempo_descoberta = millis();
+    memcpy(&aps_vistos[quant_aps], &be, sizeof(be));
+    quant_aps++;
+
+    if ((unsigned int)quant_aps >= sizeof(aps_vistos) / sizeof(aps_vistos[0]))
+    {
+      quant_aps = 0;
+    }
+  }
+  return conhece;
+}
+
+int registrar_cliente(cliente cli)
+{
+  int conhece = 0;
+  for (int i = 0; i < quant_clientes; i++)
+  {
+    if (!memcmp(clientes_vistos[i].station, cli.station, ETH_MAC_LEN))
+    {
+      clientes_vistos[i].tempo_descoberta = millis();
+      clientes_vistos[i].rssi = cli.rssi;
+      conhece = 1;
+      i = quant_clientes;
+    }
+  }
+
+  if (!conhece)
+  {
+    cli.tempo_descoberta = millis();
+    for (int i = 0; i < quant_aps; i++)
+    {
+      if (!memcmp(aps_vistos[i].bssid, cli.bssid, ETH_MAC_LEN))
+      {
+        cli.canal = aps_vistos[i].canal;
+        i = quant_aps;
+      }
+    }
+
+    if (cli.canal != 0)
+    {
+      memcpy(&clientes_vistos[quant_clientes], &cli, sizeof(cli));
+      quant_clientes++;
+    }
+
+    if ((unsigned int)quant_clientes >= sizeof(clientes_vistos) / sizeof(clientes_vistos[0]))
+    {
+      quant_clientes = 0;
+    }
+  }
+
+  return conhece;
+}
+
+void limparListas()
+{
+  for (int i = 0; i < quant_clientes; i++)
+  {
+    if ((millis() - clientes_vistos[i].tempo_descoberta) > PURGETIME)
+    {
+      for (int j = i; j < quant_clientes - 1; j++)
+        memcpy(&clientes_vistos[j], &clientes_vistos[j + 1], sizeof(clientes_vistos[j]));
+      quant_clientes--;
+      i = quant_aps;
+    }
+  }
+  for (int i = 0; i < quant_aps; i++)
+  {
+    if ((millis() - aps_vistos[i].tempo_descoberta) > PURGETIME)
+    {
+      for (int j = i; j < quant_aps - 1; j++)
+        memcpy(&aps_vistos[j], &aps_vistos[j + 1], sizeof(aps_vistos[j]));
+      quant_aps--;
+      i = quant_aps;
+    }
+  }
+}
+//=================================================================================================
 //=================================================================================================
 // Métodos para a checagem dos pacotes
 //=================================================================================================
@@ -296,13 +420,13 @@ static void ICACHE_FLASH_ATTR promiscuous_handler(uint8_t *buffer, uint16_t leng
     {
       beacon b_info = ler_beacon(sniffer->buf, 112, sniffer->wifi_ctrl.rssi);
       if (b_info.rssi > -70)
-        printarBeacon(b_info);
+        registrar_beacon(b_info);
     }
     else if (sniffer->buf[0] == 0x40)
     {
       cliente c_info = ler_probe(sniffer->buf, 36, sniffer->wifi_ctrl.rssi);
       if (c_info.rssi > -70)
-        printarCliente(c_info);
+        registrar_cliente(c_info);
     }
   }
   else
@@ -312,7 +436,7 @@ static void ICACHE_FLASH_ATTR promiscuous_handler(uint8_t *buffer, uint16_t leng
     {
       cliente c_info = ler_dados(sniffer->buf, 36, sniffer->rx_ctrl.rssi, sniffer->rx_ctrl.channel);
       if (c_info.rssi > -70)
-        printarCliente(c_info);
+        registrar_cliente(c_info);
     }
   }
 }
@@ -330,7 +454,33 @@ void pularCanal()
 }
 
 //=================================================================================================
+//=================================================================================================
+// Métodos Wi-Fi
+//=================================================================================================
+void setWiFi()
+{
+  delay(10);
+  Serial.println("Conectando a: " + String(SSID));
 
+  WiFi.begin(SSID, PASSWORD);
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(100);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("Conectado na Rede " + String(SSID) + " | IP => ");
+  Serial.println(WiFi.localIP());
+}
+
+void enviar_beacon(beacon be)
+{
+}
+
+void enviar_cliente(cliente ci)
+{
+}
+//=================================================================================================
 //=================================================================================================
 // Métodos comuns
 //=================================================================================================
@@ -355,6 +505,7 @@ void setup()
 
 void loop()
 {
+
   delay(10);
 }
 
