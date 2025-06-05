@@ -22,13 +22,14 @@
 #define ENABLE 1
 
 #define CHANNEL_HOP_INTERVAL_MS 1000
-static os_timer_t channelHop_timer;
 
 // Informação do WiFi
 const char *SSID = "2G NET";         // Rede wifi
 const char *PASSWORD = "2512101406"; // Senha da rede wifi
+bool enviando = false;
 
-String BASE_URL = "https://backend-ti5-production.up.railway.app/";
+String BASE_URL = "https://backend-ti5-production.up.railway.app/teste";
+
 //=================================================================================================
 // Definições de struct
 //=================================================================================================
@@ -116,6 +117,8 @@ int quant_aps = 0;
 int quant_clientes = 0;
 int nada_novo = 0;
 int quant_clientes_velho = 0, quant_aps_velho = 0;
+int channel = 1;
+int begin_send;
 //=================================================================================================
 
 //=================================================================================================
@@ -130,9 +133,8 @@ cliente ler_dados(uint8_t *quadro, uint16_t len, signed rssi, unsigned canal);
 beacon ler_beacon(uint8_t *quadro, uint16_t len, signed rssi);
 void printarCliente(cliente cli);
 void printarBeacon(beacon be);
-void setWiFi();
-void enviar_cliente(cliente ci);
-void enviar_beacon(beacon be);
+void enviar_cliente();
+void ligar_rastreio();
 //=================================================================================================
 //=================================================================================================
 // Métodos para as structs
@@ -328,6 +330,7 @@ int registrar_beacon(beacon be)
     be.tempo_descoberta = millis();
     memcpy(&aps_vistos[quant_aps], &be, sizeof(be));
     quant_aps++;
+    printarBeacon(be);
 
     if ((unsigned int)quant_aps >= sizeof(aps_vistos) / sizeof(aps_vistos[0]))
     {
@@ -367,6 +370,7 @@ int registrar_cliente(cliente cli)
     {
       memcpy(&clientes_vistos[quant_clientes], &cli, sizeof(cli));
       quant_clientes++;
+      printarCliente(cli);
     }
 
     if ((unsigned int)quant_clientes >= sizeof(clientes_vistos) / sizeof(clientes_vistos[0]))
@@ -387,7 +391,6 @@ void limparListas()
       for (int j = i; j < quant_clientes - 1; j++)
         memcpy(&clientes_vistos[j], &clientes_vistos[j + 1], sizeof(clientes_vistos[j]));
       quant_clientes--;
-      i = quant_aps;
     }
   }
   for (int i = 0; i < quant_aps; i++)
@@ -397,7 +400,6 @@ void limparListas()
       for (int j = i; j < quant_aps - 1; j++)
         memcpy(&aps_vistos[j], &aps_vistos[j + 1], sizeof(aps_vistos[j]));
       quant_aps--;
-      i = quant_aps;
     }
   }
 }
@@ -419,14 +421,14 @@ static void ICACHE_FLASH_ATTR promiscuous_handler(uint8_t *buffer, uint16_t leng
     if (sniffer->buf[0] == 0x80)
     {
       beacon b_info = ler_beacon(sniffer->buf, 112, sniffer->wifi_ctrl.rssi);
-      if (b_info.rssi > -70)
-        registrar_beacon(b_info);
+      //  if (b_info.rssi > -70)
+      registrar_beacon(b_info);
     }
     else if (sniffer->buf[0] == 0x40)
     {
       cliente c_info = ler_probe(sniffer->buf, 36, sniffer->wifi_ctrl.rssi);
-      if (c_info.rssi > -70)
-        registrar_cliente(c_info);
+      //   if (c_info.rssi > -70)
+      registrar_cliente(c_info);
     }
   }
   else
@@ -435,22 +437,10 @@ static void ICACHE_FLASH_ATTR promiscuous_handler(uint8_t *buffer, uint16_t leng
     if ((sniffer->buf[0] == 0x08) || (sniffer->buf[0] == 0x88))
     {
       cliente c_info = ler_dados(sniffer->buf, 36, sniffer->rx_ctrl.rssi, sniffer->rx_ctrl.channel);
-      if (c_info.rssi > -70)
-        registrar_cliente(c_info);
+      //   if (c_info.rssi > -70)
+      registrar_cliente(c_info);
     }
   }
-}
-
-void pularCanal()
-{
-  // Pular do canal 1 ao 13
-  // O 14 só existe no Japão
-  uint8 new_channel = wifi_get_channel() + 1;
-  if (new_channel > 13)
-  {
-    new_channel = 1;
-  }
-  wifi_set_channel(new_channel);
 }
 
 //=================================================================================================
@@ -473,12 +463,65 @@ void setWiFi()
   Serial.println(WiFi.localIP());
 }
 
-void enviar_beacon(beacon be)
+void enviar_cliente()
 {
+  wifi_promiscuous_enable(DISABLE);
+
+  setWiFi();
+  delay(100);
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
+    client->setInsecure();
+    HTTPClient https;
+    if (https.begin(*client, BASE_URL))
+    {
+      cliente ci;
+
+      for (int i = begin_send; i < quant_clientes; i++)
+      {
+
+        ci = clientes_vistos[i];
+
+        String resp = "{\"MAC\":\"" + lerMAC(ci.station) + "\",\"RSSI\":\"" + ci.rssi + "\"}";
+        int httpCode = -1;
+
+        while (httpCode != 200)
+        {
+          https.addHeader("Content-Type", "application/json");
+          httpCode = https.POST(resp);
+
+          if (httpCode != 200)
+          {
+            Serial.println("Erro,tentando novamente");
+            delay(6000);
+          }
+        }
+
+        Serial.print("HTTP Response code: ");
+        Serial.println(httpCode);
+      }
+
+      https.end();
+      delay(10);
+      wifi_promiscuous_enable(ENABLE);
+    }
+    else
+    {
+      Serial.printf("[HTTPS] Unable to connect\n");
+    }
+  }
 }
 
-void enviar_cliente(cliente ci)
+void ligar_rastreio()
 {
+  wifi_set_opmode(STATION_MODE);
+  wifi_set_channel(1);
+  wifi_promiscuous_enable(DISABLE);
+  delay(10);
+  wifi_set_promiscuous_rx_cb(promiscuous_handler);
+  delay(10);
+  wifi_promiscuous_enable(ENABLE);
 }
 //=================================================================================================
 //=================================================================================================
@@ -490,23 +533,39 @@ void setup()
 
   Serial.begin(115200);
   delay(10);
-  wifi_set_opmode(STATION_MODE);
-  wifi_set_channel(1);
-  wifi_promiscuous_enable(DISABLE);
-  delay(10);
-  wifi_set_promiscuous_rx_cb(promiscuous_handler);
-  delay(10);
-  wifi_promiscuous_enable(ENABLE);
-
-  os_timer_disarm(&channelHop_timer);
-  os_timer_setfn(&channelHop_timer, (os_timer_func_t *)pularCanal, NULL);
-  os_timer_arm(&channelHop_timer, CHANNEL_HOP_INTERVAL_MS, 1);
+  ligar_rastreio();
 }
 
 void loop()
 {
+  channel = 1;
+  wifi_set_channel(channel);
+  while (true)
+  {
+    nada_novo++;
+    if (nada_novo > 200)
+    {
+      nada_novo = 0;
+      channel++;
+      if (channel == 15)
+        break;
+      wifi_set_channel(channel);
+    }
+    delay(1);
 
-  delay(10);
+    if (quant_clientes > quant_clientes_velho)
+    {
+      enviando = true;
+      begin_send = quant_clientes_velho;
+      quant_clientes_velho = quant_clientes;
+    }
+  }
+  limparListas();
+  if (enviando)
+  {
+    enviar_cliente();
+    enviando = false;
+  }
 }
 
 //=================================================================================================
